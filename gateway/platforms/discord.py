@@ -1898,90 +1898,64 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)
 
-        # Register skills under a single /skill command group with category
-        # subcommand groups.  This uses 1 top-level slot instead of N,
-        # supporting up to 25 categories × 25 skills = 625 skills.
-        self._register_skill_group(tree)
+        # Register a single /skill command with autocomplete. Discord applies
+        # an 8 KB max-size limit to a single command definition, so encoding
+        # every installed skill as nested subcommands does not scale.
+        self._register_skill_command(tree)
 
-    def _register_skill_group(self, tree) -> None:
-        """Register a ``/skill`` command group with category subcommand groups.
-
-        Skills are organized by their directory category under ``SKILLS_DIR``.
-        Each category becomes a subcommand group; root-level skills become
-        direct subcommands.  Discord supports 25 subcommand groups × 25
-        subcommands each = 625 skills — well beyond the old 100-command cap.
-        """
+    def _register_skill_command(self, tree) -> None:
+        """Register a compact ``/skill`` command with name autocomplete."""
         try:
-            from hermes_cli.commands import discord_skill_commands_by_category
+            from agent.skill_commands import resolve_skill_command_key
+            from hermes_cli.commands import discord_skill_autocomplete_entries
 
-            existing_names = set()
-            try:
-                existing_names = {cmd.name for cmd in tree.get_commands()}
-            except Exception:
-                pass
-
-            categories, uncategorized, hidden = discord_skill_commands_by_category(
-                reserved_names=existing_names,
-            )
-
-            if not categories and not uncategorized:
+            skill_entries = discord_skill_autocomplete_entries()
+            if not skill_entries:
                 return
 
-            skill_group = discord.app_commands.Group(
-                name="skill",
-                description="Run a Hermes skill",
+            skill_lookup = {display_name: cmd_key for display_name, _desc, cmd_key in skill_entries}
+
+            @tree.command(name="skill", description="Run an installed Hermes skill")
+            @discord.app_commands.describe(
+                name="Skill name",
+                args="Optional arguments for the skill",
             )
-
-            # ── Helper: build a callback for a skill command key ──
-            def _make_handler(_key: str):
-                @discord.app_commands.describe(args="Optional arguments for the skill")
-                async def _handler(interaction: discord.Interaction, args: str = ""):
-                    await self._run_simple_slash(interaction, f"{_key} {args}".strip())
-                _handler.__name__ = f"skill_{_key.lstrip('/').replace('-', '_')}"
-                return _handler
-
-            # ── Uncategorized (root-level) skills → direct subcommands ──
-            for discord_name, description, cmd_key in uncategorized:
-                cmd = discord.app_commands.Command(
-                    name=discord_name,
-                    description=description or f"Run the {discord_name} skill",
-                    callback=_make_handler(cmd_key),
-                )
-                skill_group.add_command(cmd)
-
-            # ── Category subcommand groups ──
-            for cat_name in sorted(categories):
-                cat_desc = f"{cat_name.replace('-', ' ').title()} skills"
-                if len(cat_desc) > 100:
-                    cat_desc = cat_desc[:97] + "..."
-                cat_group = discord.app_commands.Group(
-                    name=cat_name,
-                    description=cat_desc,
-                    parent=skill_group,
-                )
-                for discord_name, description, cmd_key in categories[cat_name]:
-                    cmd = discord.app_commands.Command(
-                        name=discord_name,
-                        description=description or f"Run the {discord_name} skill",
-                        callback=_make_handler(cmd_key),
+            async def slash_skill(interaction: discord.Interaction, name: str, args: str = ""):
+                cmd_key = skill_lookup.get(name) or resolve_skill_command_key(name)
+                if not cmd_key:
+                    await interaction.response.send_message(
+                        f"Unknown skill `{name}`. Use autocomplete to pick an installed skill.",
+                        ephemeral=True,
                     )
-                    cat_group.add_command(cmd)
+                    return
+                await self._run_simple_slash(interaction, f"{cmd_key} {args}".strip())
 
-            tree.add_command(skill_group)
+            @slash_skill.autocomplete("name")
+            async def slash_skill_name_autocomplete(
+                interaction: discord.Interaction,
+                current: str,
+            ):
+                needle = (current or "").strip().lower()
+                matches = []
+                for display_name, description, _cmd_key in skill_entries:
+                    haystack = f"{display_name} {description}".lower()
+                    if needle and needle not in haystack:
+                        continue
+                    choice_name = display_name if not description else f"{display_name} — {description}"
+                    if len(choice_name) > 100:
+                        choice_name = choice_name[:97] + "..."
+                    matches.append(discord.app_commands.Choice(name=choice_name, value=display_name))
+                    if len(matches) >= 25:
+                        break
+                return matches
 
-            total = sum(len(v) for v in categories.values()) + len(uncategorized)
             logger.info(
-                "[%s] Registered /skill group: %d skill(s) across %d categories"
-                " + %d uncategorized",
-                self.name, total, len(categories), len(uncategorized),
+                "[%s] Registered /skill command with autocomplete for %d skill(s)",
+                self.name,
+                len(skill_entries),
             )
-            if hidden:
-                logger.warning(
-                    "[%s] %d skill(s) not registered (Discord subcommand limits)",
-                    self.name, hidden,
-                )
         except Exception as exc:
-            logger.warning("[%s] Failed to register /skill group: %s", self.name, exc)
+            logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
 
     def _build_slash_event(self, interaction: discord.Interaction, text: str) -> MessageEvent:
         """Build a MessageEvent from a Discord slash command interaction."""

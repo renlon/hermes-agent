@@ -583,6 +583,62 @@ def discord_skill_commands(
     )
 
 
+def discord_skill_autocomplete_entries() -> list[tuple[str, str, str]]:
+    """Return active Discord skill entries for ``/skill`` autocomplete.
+
+    Discord rejects command definitions larger than 8 KB. Registering every
+    installed skill as a subcommand tree quickly breaches that limit, so the
+    Discord gateway uses a single ``/skill`` command with autocomplete instead.
+
+    Returns:
+        ``[(display_name, description, cmd_key), ...]`` sorted by command key.
+        ``display_name`` is the user-facing skill name without a leading slash.
+    """
+    from pathlib import Path as _P
+
+    _platform_disabled: set[str] = set()
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        _platform_disabled = get_disabled_skill_names(platform="discord")
+    except Exception:
+        pass
+
+    entries: list[tuple[str, str, str]] = []
+    try:
+        from agent.skill_commands import get_skill_commands
+        from tools.skills_tool import SKILLS_DIR
+
+        _skills_dir = SKILLS_DIR.resolve()
+        _hub_dir = (SKILLS_DIR / ".hub").resolve()
+        skill_cmds = get_skill_commands()
+
+        for cmd_key in sorted(skill_cmds):
+            info = skill_cmds[cmd_key]
+            skill_path = info.get("skill_md_path", "")
+            if not skill_path:
+                continue
+
+            sp = _P(skill_path).resolve()
+            if not str(sp).startswith(str(_skills_dir)):
+                continue
+            if str(sp).startswith(str(_hub_dir)):
+                continue
+
+            skill_name = info.get("name", "")
+            if skill_name in _platform_disabled:
+                continue
+
+            desc = info.get("description", "")
+            if len(desc) > 100:
+                desc = desc[:97] + "..."
+
+            entries.append((cmd_key.lstrip("/"), desc, cmd_key))
+    except Exception:
+        pass
+
+    return entries
+
+
 def discord_skill_commands_by_category(
     reserved_names: set[str],
 ) -> tuple[dict[str, list[tuple[str, str, str]]], list[tuple[str, str, str]], int]:
